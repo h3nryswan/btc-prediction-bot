@@ -1,0 +1,142 @@
+import sys
+import os
+
+# Add the root directory to sys.path
+root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(root_dir)
+
+import sys
+import os
+import time
+import yfinance as yf
+import keyboard
+from tensorflow.keras.models import load_model
+import pandas as pd
+from threading import Thread
+from flask import Flask, jsonify
+from preprocessing.data_preprocessing import scale_data
+from utils.utils import reshape_data
+
+app = Flask(__name__)
+
+# Statistics dictionary to store real-time trading results
+statistics = {
+    "total_trades": 0,
+    "total_profit_loss": 0.0,
+    "win_rate": 0.0,
+    "winning_trades": 0,
+    "losing_trades": 0,
+    "average_profit_loss": 0.0,
+    "last_trade": None
+}
+
+def fetch_latest_data():
+    """Fetch the latest data from Yahoo Finance. Return None if fetching fails or data is empty."""
+    try:
+        btc = yf.Ticker("BTC-USD")
+        latest_data = btc.history(period="1d", interval="1m")
+        
+        # Check if data is empty
+        if latest_data.empty:
+            print("Warning: No data retrieved. The ticker may be temporarily unavailable.")
+            return None
+
+        latest_data = latest_data[["Open", "High", "Low", "Close", "Volume"]]
+        return latest_data
+    except Exception as e:
+        print(f"Data retrieval failed: {e}")
+        return None
+
+
+def update_statistics(profit_loss):
+    global statistics
+    statistics["total_trades"] += 1
+    statistics["total_profit_loss"] += profit_loss
+    statistics["average_profit_loss"] = statistics["total_profit_loss"] / statistics["total_trades"]
+
+    if profit_loss > 0:
+        statistics["winning_trades"] += 1
+    else:
+        statistics["losing_trades"] += 1
+
+    statistics["win_rate"] = (statistics["winning_trades"] / statistics["total_trades"]) * 100
+    statistics["last_trade"] = profit_loss
+
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    """Return the current trading statistics in JSON format."""
+    return jsonify(statistics)
+
+def generate_real_time_signals(model, window_size=30):
+    print("Press 'q' at any time to stop the real-time predictions.\n")
+    
+    last_signal = None
+    last_price = None
+
+    while True:
+        if keyboard.is_pressed("q"):
+            print("Exiting real-time predictions.")
+            break
+
+        # Fetch the latest data
+        data = fetch_latest_data()
+
+        if data is None:
+            print("Data retrieval failed. Waiting for the next cycle.")
+            time.sleep(60)  # Wait until the next cycle if data fetch fails
+            continue
+
+        live_price = data['Close'].iloc[-1]
+
+        
+
+        # Process the data and make predictions
+        _, scaler = scale_data(data)
+        scaled_data, _ = scale_data(data)
+        X, _ = reshape_data(scaled_data, window_size)
+        
+        # Predict and generate signals
+        predictions = model.predict(X[-1:])
+        current_signal = "Buy" if predictions[0][0] > 0.5 else "Sell"
+        
+         # Only calculate and record profit/loss if the signal changes
+        if last_signal and last_price and current_signal != last_signal:
+            if last_signal == "Buy" and current_signal == "Sell":
+                # Calculate profit/loss as if we are selling now
+                profit_loss = live_price - last_price
+                action = "Profit" if profit_loss > 0 else "Loss"
+                print(f"{action} from previous 'Buy' at ${last_price:.2f} -> Current 'Sell' at ${live_price:.2f}: ${profit_loss:.2f}")
+            elif last_signal == "Sell" and current_signal == "Buy":
+                # Calculate profit/loss as if we are buying now
+                profit_loss = last_price - live_price
+                action = "Profit" if profit_loss > 0 else "Loss"
+                print(f"{action} from previous 'Sell' at ${last_price:.2f} -> Current 'Buy' at ${live_price:.2f}: ${profit_loss:.2f}")
+
+            # Update statistics with the recorded profit or loss
+            update_statistics(profit_loss)
+
+        # Display live price and current signal
+        print(f"Live Price: ${live_price:.2f} | Signal: {current_signal}")
+
+        # Update the last signal and price for the next calculation only if there was a signal change
+        if current_signal != last_signal:
+            last_signal = current_signal
+            last_price = live_price
+
+        # Wait 60 seconds, checking every 5 seconds if "q" has been pressed to exit
+        for _ in range(12):  # 12 * 5 seconds = 60 seconds
+            if keyboard.is_pressed("q"):
+                print("Exiting real-time predictions.")
+                return
+            time.sleep(5)
+
+def start_server():
+    """Start the Flask server."""
+    app.run(host="0.0.0.0", port=5000)
+
+if __name__ == "__main__":
+    model = load_model('models/btc_lstm_model.keras')
+    # Start Flask server in a separate thread
+    Thread(target=start_server).start()
+    # Start the trading bot
+    generate_real_time_signals(model)
